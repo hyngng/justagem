@@ -20,7 +20,6 @@ import com.hyngng.justagem.ui.voice.VoiceSessionController
 import com.hyngng.justagem.data.ChatMessage
 import com.hyngng.justagem.data.ChatRole
 import com.hyngng.justagem.data.ChatSession
-import com.hyngng.justagem.data.SessionStore
 import com.hyngng.justagem.data.titleFrom
 import com.hyngng.justagem.media.PhotoSemanticIndexManager
 import com.hyngng.justagem.ui.i18n.AppLanguage
@@ -114,7 +113,6 @@ data class ChatUiState(
  */
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val store = SessionStore(application)
     private val engine = GemmaEngine(application)
     val photoIndexManager = PhotoSemanticIndexManager(application)
 
@@ -137,13 +135,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // skips cold start.
     private var warmupJob: Job? = null
     private var generationJob: Job? = null
-    private val persistLock = Any()
-    private var persistFailureNoticeShown = false
-    private var pendingPersist: SessionStore.PersistedState? = null
-    private var persistJob: Job? = null
+    private val persistence = ChatStatePersistence(
+        application = application,
+        scope = viewModelScope,
+        state = { uiState },
+        mutate = { transform -> updateState(transform) },
+        postNotice = { text -> notice(text) },
+        postRestore = { if (!uiState.warmupEnabled) cancelModelWarmup() },
+    )
+
     private var titleJob: Job? = null
     private var titleJobSessionId: String? = null
-    private var persistedStateLoaded = false
     private var toolConfirmation: CompletableDeferred<Boolean>? = null
     // Model chosen during streaming; applied when the current turn ends.
     private var pendingModel: ModelOption? = null
@@ -169,41 +171,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 file.name == "gemtalk_documents.json.tmp"
         }?.forEach { runCatching { it.delete() } }
         probeModel()
-        viewModelScope.launch(Dispatchers.IO) {
-            val persisted = store.load()
-            val sessions = persisted.sessions.filter { it.messages.isNotEmpty() }
-            withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
-                if (!persistedStateLoaded) {
-                    val defaults = ChatUiState()
-                    val current = uiState
-                    uiState = uiState.copy(
-                        sessions = if (current.sessions.isEmpty()) sessions else current.sessions,
-                        activeId = current.activeId,
-                        messages = current.messages,
-                        hapticsEnabled = if (current.hapticsEnabled == defaults.hapticsEnabled) persisted.hapticsEnabled else current.hapticsEnabled,
-                        soundsEnabled = if (current.soundsEnabled == defaults.soundsEnabled) persisted.soundsEnabled else current.soundsEnabled,
-                        warmupEnabled = if (current.warmupEnabled == defaults.warmupEnabled) persisted.warmupEnabled else current.warmupEnabled,
-                        languageTag = if (current.languageTag == defaults.languageTag) persisted.languageTag else current.languageTag,
-                        prePrompt = if (current.prePrompt == defaults.prePrompt) persisted.prePrompt else current.prePrompt,
-                        thinkingEnabled = if (current.thinkingEnabled == defaults.thinkingEnabled) persisted.thinkingEnabled else current.thinkingEnabled,
-                        temperature = if (current.temperature == defaults.temperature) persisted.temperature else current.temperature,
-                        topK = if (current.topK == defaults.topK) persisted.topK else current.topK,
-                        maxOutputTokens = if (current.maxOutputTokens == defaults.maxOutputTokens) persisted.maxOutputTokens else current.maxOutputTokens,
-                        model = if (current.model.baseModel == null && !persisted.lastBaseModel.isNullOrBlank()) {
-                            current.model.copy(baseModel = persisted.lastBaseModel)
-                        } else {
-                            current.model
-                        },
-                    )
-                    persistedStateLoaded = true
-                    // Mirror the restored language for non-composable notices.
-                    updateProcessLanguage(AppLanguage.resolve(uiState.languageTag))
-                    // A persisted "off" wins over any warmup already kicked
-                    // off before the stored state was readable.
-                    if (!uiState.warmupEnabled) cancelModelWarmup()
-                }
-            }
-        }
+        persistence.restore()
         viewModelScope.launch(Dispatchers.IO) {
             photoIndexManager.loadIndex()
         }
@@ -1219,71 +1187,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _feedbackEvents.tryEmit(AppFeedbackEvent(cue = cue, allowSound = allowSound))
     }
 
-    /**
-     * The field list of a disk snapshot lives here so regular saves and the
-     * onCleared fallback can never drift apart. lastBaseModel stays
-     * caller-controlled: the fallback runs when nothing was ever loaded, so it
-     * must not record a model that was never resolved.
-     */
-    private fun persistedState(lastBaseModel: String?) =
-        SessionStore.PersistedState(
-            sessions = uiState.sessions,
-            activeId = uiState.activeId,
-            hapticsEnabled = uiState.hapticsEnabled,
-            soundsEnabled = uiState.soundsEnabled,
-            warmupEnabled = uiState.warmupEnabled,
-            languageTag = uiState.languageTag,
-            prePrompt = uiState.prePrompt,
-            thinkingEnabled = uiState.thinkingEnabled,
-            temperature = uiState.temperature,
-            topK = uiState.topK,
-            maxOutputTokens = uiState.maxOutputTokens,
-            lastBaseModel = lastBaseModel,
-        )
-
     private fun persist() {
-        if (!persistedStateLoaded) return
-        val snapshot = persistedState(lastBaseModel = uiState.model.baseModel)
-        synchronized(persistLock) {
-            pendingPersist = snapshot
-            if (persistJob != null) return
-            persistJob = viewModelScope.launch(Dispatchers.IO) {
-                while (true) {
-                    val next = synchronized(persistLock) {
-                        val value = pendingPersist
-                        pendingPersist = null
-                        if (value == null) {
-                            persistJob = null
-                        }
-                        value
-                    } ?: return@launch
-                    val saved = store.save(next)
-                    val notifyFailure = synchronized(persistLock) {
-                        if (saved) {
-                            persistFailureNoticeShown = false
-                            false
-                        } else if (persistFailureNoticeShown) {
-                            false
-                        } else {
-                            persistFailureNoticeShown = true
-                            true
-                        }
-                    }
-                    if (notifyFailure) {
-                        withContext(Dispatchers.Main.immediate) {
-                            notice(tr("대화를 저장하지 못했어요. 저장 공간을 확인해 주세요.", "Could not save the conversation. Check available storage."))
-                        }
-                    }
-                }
-            }
-        }
+        persistence.scheduleSave()
     }
 
     override fun onCleared() {
-        val snapshot = synchronized(persistLock) {
-            pendingPersist ?: persistedState(lastBaseModel = null)
-        }
-        store.save(snapshot)
+        persistence.saveNow()
         generationJob?.cancel()
         photoIndexManager.close()
         engine.close()
