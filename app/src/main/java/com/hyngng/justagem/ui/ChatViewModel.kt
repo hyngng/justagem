@@ -6,8 +6,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.mlkit.genai.common.FeatureStatus
-import com.hyngng.justagem.ai.DownloadEvent
 import com.hyngng.justagem.ai.GemmaEngine
 import com.hyngng.justagem.ai.GenerationUpdate
 import com.hyngng.justagem.ai.ModelOption
@@ -128,12 +126,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         uiState = transform(uiState)
     }
 
-    private var probeJob: Job? = null
-    private var downloadJob: Job? = null
-    // Pre-loads the accelerator once after the model turns READY (probe or
-    // download), or on the first composer touch, so the first real turn
-    // skips cold start.
-    private var warmupJob: Job? = null
     private var generationJob: Job? = null
     private val persistence = ChatStatePersistence(
         application = application,
@@ -147,8 +139,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var titleJob: Job? = null
     private var titleJobSessionId: String? = null
     private var toolConfirmation: CompletableDeferred<Boolean>? = null
-    // Model chosen during streaming; applied when the current turn ends.
-    private var pendingModel: ModelOption? = null
     private val noticeIds = AtomicLong(0L)
     private val _feedbackEvents = MutableSharedFlow<AppFeedbackEvent>(extraBufferCapacity = 8)
     val feedbackEvents = _feedbackEvents.asSharedFlow()
@@ -161,6 +151,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         isGenerating = { uiState.isGenerating },
         beginVoiceTurn = { utterance -> beginVoiceTurnFromSpeech(utterance) },
         stopGenerationNow = { stopGeneration() },
+    )
+
+    private val modelLifecycle = ModelLifecycleController(
+        engine = engine,
+        scope = viewModelScope,
+        state = { uiState },
+        mutate = { transform -> updateState(transform) },
+        postNotice = { text -> notice(text) },
+        onProbeResolvedModel = { persist() },
     )
 
     init {
@@ -180,144 +179,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------------------------------------------------------- model
 
     fun probeModel() {
-        probeJob?.cancel()
-        uiState = uiState.copy(
-            model = uiState.model.copy(phase = ModelPhase.CHECKING, error = null),
-        )
-        probeJob = viewModelScope.launch {
-            val probe = engine.probe()
-            val phase = when (probe.status) {
-                FeatureStatus.AVAILABLE -> ModelPhase.READY
-                FeatureStatus.DOWNLOADABLE, FeatureStatus.DOWNLOADING -> ModelPhase.DOWNLOADABLE
-                else -> if (probe.error != null) ModelPhase.ERROR else ModelPhase.UNAVAILABLE
-            }
-            uiState = uiState.copy(
-                model = ModelUi(
-                    phase = phase,
-                    label = probe.label,
-                    baseModel = probe.baseModel,
-                    status = probe.status,
-                    detail = probe.detail ?: probe.error,
-                    fallback = probe.fallback,
-                    error = if (phase == ModelPhase.ERROR) probe.error else null,
-                    options = probe.options,
-                    supportsTools = probe.supportsTools,
-                ),
-            )
-            if (probe.baseModel != null) persist()
-            if (phase == ModelPhase.READY) warmupModel()
-        }
+        modelLifecycle.probe()
     }
 
-    /**
-     * Quiet background warmup: raises the accelerator so the first user turn
-     * avoids the 1.5–3s cold start. Guarded strategies per the warm-up plan:
-     * not while generating (real turns own AICore), canceled before send.
-     */
     fun warmupModel() {
-        if (!uiState.warmupEnabled) return
-        if (uiState.model.phase != ModelPhase.READY) return
-        if (uiState.isGenerating) return
-        warmupJob?.cancel()
-        warmupJob = viewModelScope.launch(Dispatchers.IO) {
-            engine.warmup()
-        }
+        modelLifecycle.warmup()
     }
 
     private fun cancelModelWarmup() {
-        warmupJob?.cancel()
-        warmupJob = null
+        modelLifecycle.cancelWarmup()
     }
 
     fun downloadModel() {
-        if (uiState.model.phase == ModelPhase.DOWNLOADING) return
-        downloadJob?.cancel()
-        uiState = uiState.copy(
-            model = uiState.model.copy(
-                phase = ModelPhase.DOWNLOADING,
-                downloadedBytes = 0,
-                totalBytes = 0,
-                error = null,
-            ),
-        )
-        downloadJob = viewModelScope.launch {
-            engine.download().collect { event ->
-                when (event) {
-                    is DownloadEvent.Started -> uiState = uiState.copy(
-                        model = uiState.model.copy(
-                            phase = ModelPhase.DOWNLOADING,
-                            totalBytes = event.totalBytes,
-                        ),
-                    )
-
-                    is DownloadEvent.Progress -> uiState = uiState.copy(
-                        model = uiState.model.copy(
-                            phase = ModelPhase.DOWNLOADING,
-                            downloadedBytes = event.downloadedBytes,
-                            totalBytes = event.totalBytes,
-                        ),
-                    )
-
-                    is DownloadEvent.Completed -> {
-                        uiState = uiState.copy(
-                            model = uiState.model.copy(
-                                phase = ModelPhase.READY,
-                                baseModel = event.baseModel ?: uiState.model.baseModel,
-                                error = null,
-                            ),
-                        )
-                        notice(
-                            tr(
-                                "${uiState.model.label} 준비가 끝났어요.",
-                                "${uiState.model.label} is ready.",
-                            ),
-                        )
-                        warmupModel()
-                    }
-
-                    is DownloadEvent.Failed -> uiState = uiState.copy(
-                        model = uiState.model.copy(
-                            phase = ModelPhase.ERROR,
-                            error = event.message,
-                        ),
-                    )
-                }
-            }
-        }
+        modelLifecycle.download()
     }
 
     fun selectModel(option: ModelOption) {
         titleJob?.cancel()
         titleJob = null
-        if (uiState.isGenerating) {
-            // Switching the engine closes the active client, which would abort
-            // the response that is still streaming. Keep the choice visible now
-            // and swap the engine once the current turn ends.
-            pendingModel = option
-        } else {
-            pendingModel = null
-            cancelModelWarmup()
-            engine.selectModel(option)
-        }
-        val phase = when (option.status) {
-            FeatureStatus.AVAILABLE -> ModelPhase.READY
-            FeatureStatus.DOWNLOADABLE -> ModelPhase.DOWNLOADABLE
-            FeatureStatus.DOWNLOADING -> ModelPhase.DOWNLOADING
-            else -> if (option.error != null) ModelPhase.ERROR else ModelPhase.UNAVAILABLE
-        }
-        uiState = uiState.copy(
-            model = uiState.model.copy(
-                phase = phase,
-                label = option.label,
-                baseModel = option.baseModel,
-                status = option.status,
-                fallback = option.preference == com.google.mlkit.genai.prompt.ModelPreference.FAST,
-                detail = option.error,
-                error = if (phase == ModelPhase.ERROR) option.error else null,
-                supportsTools = option.supportsTools,
-                pendingSelection = uiState.isGenerating,
-            ),
-        )
+        modelLifecycle.select(option)
     }
 
     fun setThinkingEnabled(enabled: Boolean) {
@@ -647,10 +527,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             toolCallPreparing = false,
             toolCallName = null,
         )
-        pendingModel?.let {
-            pendingModel = null
-            engine.selectModel(it)
-        }
+        modelLifecycle.applyPendingModel()
         persist()
     }
 
@@ -1051,10 +928,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Apply a model the user picked while this turn was streaming. The
         // engine switch closes the old client, so it must wait until the turn
         // has really ended.
-        pendingModel?.let {
-            pendingModel = null
-            engine.selectModel(it)
-        }
+        modelLifecycle.applyPendingModel()
         uiState = uiState.copy(
             isGenerating = false,
             streamingMessageId = null,
