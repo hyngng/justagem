@@ -1,20 +1,10 @@
 package com.hyngng.justagem.media
 
-import android.content.ContentUris
 import android.content.Context
-import android.content.Intent
-import android.app.PendingIntent
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.os.SystemClock
 import android.net.Uri
-import android.provider.MediaStore
 import android.util.JsonReader
-import androidx.core.app.NotificationCompat
-import com.hyngng.justagem.MainActivity
-import com.hyngng.justagem.R
 import com.hyngng.justagem.ui.i18n.tr
 import com.google.mlkit.genai.common.FeatureStatus
 import com.google.mlkit.genai.common.GenAiException
@@ -126,17 +116,13 @@ private sealed interface ImageEmbeddingOutcome {
 class PhotoSemanticIndexManager(context: Context) {
 
     companion object {
-        private const val NOTIFICATION_CHANNEL = "photo_indexing"
         const val NOTIFICATION_ID = 4101
-        private const val REQUEST_CODE_CONTENT = 4101
-        private const val REQUEST_CODE_STOP = 4102
-        private const val NOTIFICATION_UPDATE_INTERVAL_MS = 250L
+        const val ACTION_STOP_INDEXING = "com.hyngng.justagem.STOP_PHOTO_INDEXING"
+        const val EMBEDDING_DIMENSION = 768
         private const val JOURNAL_BATCH_SIZE = 20
         private const val INDEX_COMPACT_THRESHOLD_BYTES = 8L * 1024L * 1024L
         private const val MAX_BUSY_RETRIES = 4
         private const val EMBEDDING_TASK_PROFILE = "retrieval-document-v1"
-        const val ACTION_STOP_INDEXING = "com.hyngng.justagem.STOP_PHOTO_INDEXING"
-        const val EMBEDDING_DIMENSION = 768
         private const val EMBEDDING_IMAGE_SIZE = 768
         @Volatile
         private var activeManager = WeakReference<PhotoSemanticIndexManager>(null)
@@ -157,7 +143,14 @@ class PhotoSemanticIndexManager(context: Context) {
     }
 
     private val appContext = context.applicationContext
-    private val notifications = appContext.getSystemService(NotificationManager::class.java)
+    private val notifications = PhotoIndexNotifier(
+        context = appContext,
+        notificationId = NOTIFICATION_ID,
+        contentRequestCode = 4101,
+        stopRequestCode = 4102,
+        stopAction = ACTION_STOP_INDEXING,
+    )
+    private val photoSource = MediaStorePhotoSource(appContext)
     private val indexFile = File(appContext.filesDir, "photo_semantic_index_v2.json")
     private val journalFile = File(appContext.filesDir, "photo_semantic_index_v2.journal")
     private val lock = Any()
@@ -176,23 +169,9 @@ class PhotoSemanticIndexManager(context: Context) {
     @Volatile
     private var indexLoaded = false
     private var cachedEmbeddingModel: EmbeddingModel? = null
-    private var lastNotificationPercent = -1
-    private var lastNotificationStatus = ""
-    private var lastNotificationAt = 0L
 
     init {
         activeManager = WeakReference(this)
-        notifications.createNotificationChannel(
-            NotificationChannel(
-                NOTIFICATION_CHANNEL,
-                tr("사진 색인", "Photo indexing"),
-                NotificationManager.IMPORTANCE_LOW,
-            )
-        )
-        // Indexing runs inside this process. If we are being constructed, the
-        // process that may have posted this notification is gone, so anything
-        // still in the shade belongs to a dead run and can no longer be stopped.
-        notifications.cancel(NOTIFICATION_ID)
     }
 
     fun getIndexedCount(): Int = synchronized(lock) { indexedPhotos.size }
@@ -220,7 +199,7 @@ class PhotoSemanticIndexManager(context: Context) {
     }
 
     fun refreshDevicePhotoCount() {
-        val total = queryMediaStorePhotoCount()
+        val total = photoSource.photoCount()
         if (total != null) {
             val excludedCount = synchronized(lock) { excludedPhotos.size.coerceAtMost(total) }
             val eligibleTotal = (total - excludedCount).coerceAtLeast(0)
@@ -328,9 +307,9 @@ class PhotoSemanticIndexManager(context: Context) {
 
             val modelSignature = "${model.getModelSignature()}:$EMBEDDING_TASK_PROFILE"
 
-            val devicePhotos = queryMediaStorePhotos()
+            val devicePhotos = photoSource.queryPhotos()
             val pendingDeletedIds = synchronized(lock) {
-                val currentById = devicePhotos.associateBy(MediaItem::id)
+                val currentById = devicePhotos.associateBy(MediaStorePhotoSource.PhotoItem::id)
                 val staleIds = (indexedPhotos.keys + excludedPhotos.keys).filter { id ->
                     val item = currentById[id]
                     item == null || excludedPhotos[id]?.fingerprint?.let { it != item.fingerprint } == true
@@ -362,7 +341,7 @@ class PhotoSemanticIndexManager(context: Context) {
                 currentProgress = if (eligibleTotal > 0) indexedDeviceCount.toFloat() / eligibleTotal else 1f,
                 statusMessage = tr("사진 분석 시작 (분석 가능 ${eligibleTotal}장)", "Started analyzing photos ($eligibleTotal eligible)"),
             )
-            publishIndexingNotification(force = true)
+            notifications.publish(_indexingState.value, force = true)
 
             val pendingJournalRecords = mutableListOf<PhotoRecord>()
             val pendingExcludedPhotos = mutableListOf<ExcludedPhoto>()
@@ -435,7 +414,7 @@ class PhotoSemanticIndexManager(context: Context) {
                         )
                     },
                 )
-                publishIndexingNotification()
+                notifications.publish(_indexingState.value)
 
                 if (pendingJournalRecords.size + pendingExcludedPhotos.size >= JOURNAL_BATCH_SIZE) {
                     if (appendJournal(pendingJournalRecords, pendingDeletedIds, pendingExcludedPhotos)) {
@@ -460,7 +439,7 @@ class PhotoSemanticIndexManager(context: Context) {
                     retryableFailureCount = 1,
                     statusMessage = tr("색인 결과를 저장하지 못했습니다. 다시 시도해 주세요.", "Could not save the index. Please retry."),
                 )
-                cancelIndexingNotification()
+                notifications.cancel()
             } else if (stopRequested) {
                 _indexingState.value = _indexingState.value.copy(
                     isIndexing = false,
@@ -474,7 +453,7 @@ class PhotoSemanticIndexManager(context: Context) {
                         "Indexing stopped ${finalCount}/$eligibleTotal (${(finalCount * 100 / eligibleTotal.coerceAtLeast(1)).coerceIn(0, 100)}%)",
                     ),
                 )
-                cancelIndexingNotification()
+                notifications.cancel()
             } else if (finalCount == eligibleTotal) {
                 _indexingState.value = IndexingState(
                     isIndexing = false,
@@ -489,7 +468,7 @@ class PhotoSemanticIndexManager(context: Context) {
                     ),
                     lastIndexedTime = System.currentTimeMillis(),
                 )
-                cancelIndexingNotification()
+                notifications.cancel()
                 onDone()
             } else {
                 val progress = if (eligibleTotal > 0) finalCount.toFloat() / eligibleTotal else 1f
@@ -514,7 +493,7 @@ class PhotoSemanticIndexManager(context: Context) {
                     },
                     lastIndexedTime = System.currentTimeMillis(),
                 )
-                cancelIndexingNotification()
+                notifications.cancel()
             }
             }
         } catch (e: CancellationException) {
@@ -530,7 +509,7 @@ class PhotoSemanticIndexManager(context: Context) {
                     "Indexing failed. The saved index was kept.",
                 ),
             )
-            cancelIndexingNotification()
+            notifications.cancel()
         } finally {
             if (!currentCoroutineContext().isActive && _indexingState.value.isIndexing) {
                 _indexingState.value = _indexingState.value.copy(
@@ -538,9 +517,9 @@ class PhotoSemanticIndexManager(context: Context) {
                     isStopping = false,
                     statusMessage = tr("색인이 중단되었습니다.", "Indexing was interrupted."),
                 )
-                cancelIndexingNotification()
+                notifications.cancel()
             } else if (!_indexingState.value.isIndexing) {
-                cancelIndexingNotification()
+                notifications.cancel()
             }
         }
     }
@@ -552,113 +531,7 @@ class PhotoSemanticIndexManager(context: Context) {
             isStopping = true,
             statusMessage = tr("중지하는 중", "Stopping"),
         )
-        publishIndexingNotification(force = true)
-    }
-
-    /**
-     * Removes the progress notification once a run reaches a terminal state.
-     * A finished or failed run must not leave a stale entry in the shade: the
-     * result is already visible in the settings screen and, for a partial run,
-     * as a toast.
-     */
-    private fun cancelIndexingNotification() {
-        lastNotificationAt = 0L
-        lastNotificationPercent = -1
-        lastNotificationStatus = ""
-        notifications.cancel(NOTIFICATION_ID)
-    }
-
-    private fun publishIndexingNotification(force: Boolean = false) {
-        val state = _indexingState.value
-        val percent = (state.currentProgress * 100).toInt().coerceIn(0, 100)
-        val now = SystemClock.elapsedRealtime()
-        if (!force && now - lastNotificationAt < NOTIFICATION_UPDATE_INTERVAL_MS) {
-            return
-        }
-        if (!force && percent == lastNotificationPercent && state.statusMessage == lastNotificationStatus) {
-            return
-        }
-        lastNotificationAt = now
-        lastNotificationPercent = percent
-        lastNotificationStatus = state.statusMessage
-
-        val total = state.totalDeviceCount
-        val countText = if (total > 0) {
-            tr(
-                "${"%,d".format(state.indexedCount)}/${"%,d".format(total)}장 ($percent%)",
-                "${"%,d".format(state.indexedCount)}/${"%,d".format(total)} photos ($percent%)",
-            )
-        } else {
-            tr("${"%,d".format(state.indexedCount)}장", "${"%,d".format(state.indexedCount)} photos")
-        }
-        // The system controls its own line spacing, so the only way to give the
-        // rows room is to keep the collapsed view to one short line and put the
-        // detail on separate lines that BigTextStyle shows when expanded. Only
-        // in-progress runs reach this point; terminal states cancel the entry.
-        val title = if (state.isStopping) {
-            tr("사진 색인 중지 중", "Stopping photo indexing")
-        } else {
-            tr("사진 색인", "Photo indexing")
-        }
-        val contentText = when {
-            state.isStopping -> tr("잠시만 기다려 주세요…", "Just a moment…")
-            state.isIndexing && total > 0 -> tr("사진 분석 중 ($percent%)", "Analyzing photos ($percent%)")
-            state.isIndexing -> tr("사진 분석 중", "Analyzing photos")
-            else -> state.statusMessage
-        }
-        val bigText = if (state.isIndexing) {
-            buildString {
-                append(tr("사진 분석 중", "Analyzing photos"))
-                append("\n")
-                append(countText)
-            }
-        } else {
-            state.statusMessage
-        }
-        // FLAG_ACTIVITY_SINGLE_TOP with CLEAR_TOP brings the existing MainActivity instance
-        // to the foreground rather than destroying and recreating it, ensuring active
-        // viewModelScope indexing passes continue running uninterrupted.
-        val openIntent = Intent(appContext, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val notification = NotificationCompat.Builder(appContext, NOTIFICATION_CHANNEL)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(title)
-            .setContentText(contentText)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
-            .setContentIntent(
-                PendingIntent.getActivity(
-                    appContext,
-                    REQUEST_CODE_CONTENT,
-                    openIntent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                ),
-            )
-            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
-            .setOnlyAlertOnce(true)
-            .setOngoing(state.isIndexing)
-            .setAutoCancel(!state.isIndexing)
-            .setProgress(100, percent, state.isIndexing && total == 0)
-        if (state.isIndexing) {
-            val stopIntent = Intent(appContext, PhotoIndexingNotificationReceiver::class.java)
-                .setAction(ACTION_STOP_INDEXING)
-            notification.addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                tr("중지", "Stop"),
-                PendingIntent.getBroadcast(
-                    appContext,
-                    REQUEST_CODE_STOP,
-                    stopIntent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                ),
-            )
-        }
-        val built = notification.build()
-        try {
-            notifications.notify(NOTIFICATION_ID, built)
-        } catch (_: SecurityException) { }
+        notifications.publish(_indexingState.value, force = true)
     }
 
     suspend fun clearIndex(): Boolean = indexingMutex.withLock {
@@ -686,83 +559,13 @@ class PhotoSemanticIndexManager(context: Context) {
             _indexingState.value = IndexingState(
                 isIndexing = false,
                 indexedCount = 0,
-                totalDeviceCount = queryMediaStorePhotoCount() ?: _indexingState.value.totalDeviceCount,
+                totalDeviceCount = photoSource.photoCount() ?: _indexingState.value.totalDeviceCount,
                 currentProgress = 0f,
                 statusMessage = tr("색인이 초기화되었습니다.", "The index was cleared."),
             )
-            cancelIndexingNotification()
+            notifications.cancel()
             true
         }
-    }
-
-    private fun queryMediaStorePhotoCount(): Int? {
-        val projection = arrayOf(MediaStore.Images.Media._ID)
-        return runCatching {
-            appContext.contentResolver.query(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                null,
-                null,
-                null,
-            )?.use { it.count } ?: error("MediaStore returned no cursor")
-        }.getOrNull()
-    }
-
-    private data class MediaItem(
-        val id: Long,
-        val uri: Uri,
-        val displayName: String,
-        val dateTaken: Long,
-        val width: Int,
-        val height: Int,
-        val dateModified: Long,
-        val size: Long,
-) {
-        val fingerprint: String get() = "$dateModified:$size:$width:$height:$displayName"
-    }
-
-    private fun queryMediaStorePhotos(): List<MediaItem> {
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.DATE_TAKEN,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT,
-            MediaStore.Images.Media.DATE_MODIFIED,
-            MediaStore.Images.Media.SIZE,
-        )
-        val items = mutableListOf<MediaItem>()
-        val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC"
-
-        val cursor = appContext.contentResolver.query(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            projection,
-            null,
-            null,
-            sortOrder,
-        ) ?: error("MediaStore returned no cursor")
-        cursor.use {
-            val idCol = it.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            val nameCol = it.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
-            val dateCol = it.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
-            val widthCol = it.getColumnIndex(MediaStore.Images.Media.WIDTH)
-            val heightCol = it.getColumnIndex(MediaStore.Images.Media.HEIGHT)
-            val modifiedCol = it.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED)
-            val sizeCol = it.getColumnIndex(MediaStore.Images.Media.SIZE)
-
-            while (it.moveToNext()) {
-                val id = it.getLong(idCol)
-                val name = if (nameCol >= 0) it.getString(nameCol) ?: tr("사진", "Photo") else tr("사진", "Photo")
-                val date = if (dateCol >= 0) it.getLong(dateCol) else 0L
-                val w = if (widthCol >= 0) it.getInt(widthCol) else 0
-                val h = if (heightCol >= 0) it.getInt(heightCol) else 0
-                val modified = if (modifiedCol >= 0) it.getLong(modifiedCol) else 0L
-                val size = if (sizeCol >= 0) it.getLong(sizeCol) else 0L
-                val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                items.add(MediaItem(id, uri, name, date, w, h, modified, size))
-            }
-        }
-        return items
     }
 
     /**
@@ -1000,7 +803,7 @@ class PhotoSemanticIndexManager(context: Context) {
             }
 
             val indexedCount = indexedPhotos.size
-            val rawPhotoCount = queryMediaStorePhotoCount() ?: _indexingState.value.totalDeviceCount + excludedPhotos.size
+            val rawPhotoCount = photoSource.photoCount() ?: _indexingState.value.totalDeviceCount + excludedPhotos.size
             val eligiblePhotoCount = (rawPhotoCount - excludedPhotos.size).coerceAtLeast(0)
             _indexingState.value = IndexingState(
                 isIndexing = false,
