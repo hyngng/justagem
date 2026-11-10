@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Splash follows the same light/dark window background as the first frame. -->
-    <style name="Theme.GemTalk" parent="android:Theme.Material.NoActionBar">
+    <style name="Theme.Justagem" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/ink</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>

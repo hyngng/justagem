@@ -130,20 +130,20 @@ fun ModelSelector(
             ) {
                 androidx.compose.animation.AnimatedVisibility(
                     visibleState = menuTransition,
-                    enter = fadeIn(tween(150)) +
+                    enter = fadeIn(tween(JustagemMotion.menuFadeInMillis)) +
                         scaleIn(
-                            initialScale = 0.94f,
+                            initialScale = JustagemMotion.menuScaleFrom,
                             transformOrigin = TransformOrigin(0.5f, 0f),
                             animationSpec = tween(
                                 durationMillis = JustagemDesign.motionStandard,
                                 easing = FastOutSlowInEasing,
                             ),
                         ),
-                    exit = fadeOut(tween(120)) +
+                    exit = fadeOut(tween(JustagemMotion.menuFadeOutMillis)) +
                         scaleOut(
-                            targetScale = 0.97f,
+                            targetScale = JustagemMotion.menuScaleTo,
                             transformOrigin = TransformOrigin(0.5f, 0f),
-                            animationSpec = tween(140),
+                            animationSpec = tween(JustagemMotion.menuSwapMillis),
                         ),
                 ) {
                     Surface(

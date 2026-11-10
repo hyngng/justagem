@@ -79,6 +79,14 @@ object JustagemMotion {
     const val feedbackColorMillis = 220
     const val indicatorCycleMillis = 1_050
     const val indicatorCount = 3
+
+    // Anchor-attached popup menus (model selector, language) share one
+    // entrance/exit spec so every menu settles the same way.
+    const val menuFadeInMillis = 150
+    const val menuFadeOutMillis = 120
+    const val menuSwapMillis = 140
+    const val menuScaleFrom = 0.94f
+    const val menuScaleTo = 0.97f
 }
 
 @Composable
