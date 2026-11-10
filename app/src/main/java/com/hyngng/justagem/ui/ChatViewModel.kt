@@ -144,7 +144,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var listenJob: Job? = null
     private var inputPulseJob: Job? = null
     private var inputPulseVersion = 0L
-    private var speakJob: Job? = null
     private var speechQueueJob: Job? = null
     private var speechChannel: Channel<String>? = null
     private var autoListenJob: Job? = null
@@ -524,21 +523,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (uiState.isGenerating) {
             stopGeneration()
         }
-        val currentMessages = uiState.messages
-        val targetIndex = currentMessages.indexOfFirst { it.id == message.id }
-        if (targetIndex != -1) {
-            uiState = uiState.copy(
-                draft = message.text,
-                attachmentUris = message.attachmentUris,
-                editingMessageId = message.id,
-            )
-        } else {
-            uiState = uiState.copy(
-                draft = message.text,
-                attachmentUris = message.attachmentUris,
-                editingMessageId = message.id,
-            )
-        }
+        uiState = uiState.copy(
+            draft = message.text,
+            attachmentUris = message.attachmentUris,
+            editingMessageId = message.id,
+        )
     }
 
     fun cancelEditingMessage() {
@@ -549,6 +538,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * One gate for anything that starts a turn (text or voice). Every
+     * non-ready phase blocks the turn with a phase-specific notice; only the
+     * DOWNLOADING wording differs between the two entry points, so it is
+     * passed by the caller instead of a flag.
+     */
+    private fun modelReadyForTurn(noticeText: String): Boolean {
+        when (uiState.model.phase) {
+            ModelPhase.READY -> return true
+            ModelPhase.DOWNLOADABLE ->
+                notice(tr("먼저 Gemma 4 모델을 준비해 주세요.", "Set up the Gemma 4 model first."))
+            ModelPhase.DOWNLOADING -> notice(noticeText)
+            ModelPhase.CHECKING ->
+                notice(tr("모델 상태를 확인하는 중이에요.", "Checking the model status."))
+
+            ModelPhase.UNAVAILABLE, ModelPhase.ERROR ->
+                notice(tr("이 기기에서는 온디바이스 모델을 사용할 수 없어요.", "The on-device model is unavailable on this device."))
+        }
+        return false
+    }
+
     fun send(text: String = uiState.draft) {
         val content = text.trim()
         if (content.isEmpty() && uiState.attachmentUris.isEmpty()) return
@@ -556,28 +566,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             notice(tr("응답을 기다리는 중이에요.", "A response is still in progress."))
             return
         }
-        when (uiState.model.phase) {
-            ModelPhase.READY -> Unit
-            ModelPhase.DOWNLOADABLE -> {
-                notice(tr("먼저 Gemma 4 모델을 준비해 주세요.", "Set up the Gemma 4 model first."))
-                return
-            }
-
-            ModelPhase.DOWNLOADING -> {
-                notice(tr("모델을 내려받는 중이에요.", "The model is downloading."))
-                return
-            }
-
-            ModelPhase.CHECKING -> {
-                notice(tr("모델 상태를 확인하는 중이에요.", "Checking the model status."))
-                return
-            }
-
-            ModelPhase.UNAVAILABLE, ModelPhase.ERROR -> {
-                notice(tr("이 기기에서는 온디바이스 모델을 사용할 수 없어요.", "The on-device model is unavailable on this device."))
-                return
-            }
-        }
+        if (!modelReadyForTurn(noticeText = tr("모델을 내려받는 중이에요.", "The model is downloading."))) return
         val editingId = uiState.editingMessageId
         // The real turn owns AICore from here on — drop any pending warmup so
         // it cannot compete for quota or leave a BUSY window behind.
@@ -1162,23 +1151,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------------------------------------------------------- voice
 
     fun enterVoiceMode() {
-        when (uiState.model.phase) {
-            ModelPhase.READY -> Unit
-            ModelPhase.DOWNLOADABLE, ModelPhase.DOWNLOADING -> {
-                notice(tr("먼저 Gemma 4 모델을 준비해 주세요.", "Set up the Gemma 4 model first."))
-                return
-            }
-
-            ModelPhase.CHECKING -> {
-                notice(tr("모델 상태를 확인하는 중이에요.", "Checking the model status."))
-                return
-            }
-
-            ModelPhase.UNAVAILABLE, ModelPhase.ERROR -> {
-                notice(tr("이 기기에서는 온디바이스 모델을 사용할 수 없어요.", "The on-device model is unavailable on this device."))
-                return
-            }
-        }
+        if (!modelReadyForTurn(noticeText = tr("먼저 Gemma 4 모델을 준비해 주세요.", "Set up the Gemma 4 model first."))) return
         if (uiState.isGenerating) stopGeneration()
         // Do not grab the microphone before the user asks: the overlay opens
         // in a clear "tap to talk" state, so a quick tap can never cut a
@@ -1455,8 +1428,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         autoListenJob = null
         listenJob?.cancel()
         listenJob = null
-        speakJob?.cancel()
-        speakJob = null
         speechQueueJob?.cancel()
         speechQueueJob = null
         speechChannel?.cancel()
@@ -1526,9 +1497,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _feedbackEvents.tryEmit(AppFeedbackEvent(cue = cue, allowSound = allowSound))
     }
 
-    private fun persist() {
-        if (!persistedStateLoaded) return
-        val snapshot = SessionStore.PersistedState(
+    /**
+     * The field list of a disk snapshot lives here so regular saves and the
+     * onCleared fallback can never drift apart. lastBaseModel stays
+     * caller-controlled: the fallback runs when nothing was ever loaded, so it
+     * must not record a model that was never resolved.
+     */
+    private fun persistedState(lastBaseModel: String?) =
+        SessionStore.PersistedState(
             sessions = uiState.sessions,
             activeId = uiState.activeId,
             hapticsEnabled = uiState.hapticsEnabled,
@@ -1540,8 +1516,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             temperature = uiState.temperature,
             topK = uiState.topK,
             maxOutputTokens = uiState.maxOutputTokens,
-            lastBaseModel = uiState.model.baseModel,
+            lastBaseModel = lastBaseModel,
         )
+
+    private fun persist() {
+        if (!persistedStateLoaded) return
+        val snapshot = persistedState(lastBaseModel = uiState.model.baseModel)
         synchronized(persistLock) {
             pendingPersist = snapshot
             if (persistJob != null) return
@@ -1579,19 +1559,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         val snapshot = synchronized(persistLock) {
-            pendingPersist ?: SessionStore.PersistedState(
-                sessions = uiState.sessions,
-                activeId = uiState.activeId,
-                hapticsEnabled = uiState.hapticsEnabled,
-                soundsEnabled = uiState.soundsEnabled,
-                warmupEnabled = uiState.warmupEnabled,
-                languageTag = uiState.languageTag,
-                prePrompt = uiState.prePrompt,
-                thinkingEnabled = uiState.thinkingEnabled,
-                temperature = uiState.temperature,
-                topK = uiState.topK,
-                maxOutputTokens = uiState.maxOutputTokens,
-            )
+            pendingPersist ?: persistedState(lastBaseModel = null)
         }
         store.save(snapshot)
         generationJob?.cancel()

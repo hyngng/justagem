@@ -558,6 +558,23 @@ class GemmaEngine(context: Context) {
         }
     }.flowOn(Dispatchers.IO)
 
+    /**
+     * Keeps the answer budget inside the context room left after this
+     * request's prompt, so a multi-image turn can never wrap past the model's
+     * token limit. Token counting is best-effort — when the binding does not
+     * support it, the caller's budget is used unchanged.
+     */
+    private suspend fun capTokensToBudget(
+        model: GenerativeModel,
+        requestBuilder: GenerateContentRequest.Builder,
+        maxOutputTokens: Int,
+    ): Int {
+        val remaining = runCatching {
+            model.getTokenLimit() - model.countTokens(requestBuilder.build()).totalTokens
+        }.getOrNull()?.coerceAtLeast(1)
+        return remaining?.let { minOf(maxOutputTokens, it) } ?: maxOutputTokens
+    }
+
     private suspend fun synthesizePhotoSearchAnswer(
         model: GenerativeModel,
         history: List<ChatMessage>,
@@ -601,10 +618,8 @@ class GemmaEngine(context: Context) {
                     this.maxOutputTokens = maxOutputTokens
                     this.enableThinking = thinkingAvailable
                 }
-                val availableOutputTokens = runCatching {
-                    model.getTokenLimit() - model.countTokens(requestBuilder.build()).totalTokens
-                }.getOrNull()?.coerceAtLeast(1)
-                requestBuilder.maxOutputTokens = availableOutputTokens?.let { minOf(maxOutputTokens, it) } ?: maxOutputTokens
+                val availableOutputTokens = capTokensToBudget(model, requestBuilder, maxOutputTokens)
+                requestBuilder.maxOutputTokens = availableOutputTokens
                 val analysis = StringBuilder()
                 requestMutex.withLock {
                     model.generateContent(requestBuilder.build(), object : StreamingCallback {
@@ -668,10 +683,8 @@ class GemmaEngine(context: Context) {
             this.maxOutputTokens = maxOutputTokens
             this.enableThinking = thinkingAvailable
         }
-        val availableOutputTokens = runCatching {
-            model.getTokenLimit() - model.countTokens(requestBuilder.build()).totalTokens
-        }.getOrNull()?.coerceAtLeast(1)
-        requestBuilder.maxOutputTokens = availableOutputTokens?.let { minOf(maxOutputTokens, it) } ?: maxOutputTokens
+        val availableOutputTokens = capTokensToBudget(model, requestBuilder, maxOutputTokens)
+        requestBuilder.maxOutputTokens = availableOutputTokens
         var answerStarted = false
         try {
             requestMutex.withLock {

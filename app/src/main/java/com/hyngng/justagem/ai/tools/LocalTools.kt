@@ -356,21 +356,16 @@ private fun searchConversationsTool(
 )
 
 private fun getDateTime(timezone: String?): String {
-    val zone = if (timezone.isNullOrBlank()) {
-        ZoneId.systemDefault()
-    } else {
-        if (!isIanaZone(timezone)) {
-            return tr(
-                "알 수 없는 시간대 '$timezone'. IANA 형식 필요 (예: Asia/Seoul, America/New_York)",
-                "Unknown time zone '$timezone'. IANA format required (e.g. Asia/Seoul, America/New_York)",
-            )
-        }
-        runCatching { ZoneId.of(timezone) }.getOrElse {
-            return tr(
-                "알 수 없는 시간대 '$timezone'. IANA 형식 필요 (예: Asia/Seoul, America/New_York)",
-                "Unknown time zone '$timezone'. IANA format required (e.g. Asia/Seoul, America/New_York)",
-            )
-        }
+    val zone = when {
+        timezone.isNullOrBlank() -> ZoneId.systemDefault()
+        !isIanaZone(timezone) -> null
+        else -> runCatching { ZoneId.of(timezone) }.getOrNull()
+    }
+    if (zone == null) {
+        return tr(
+            "알 수 없는 시간대 '$timezone'. IANA 형식 필요 (예: Asia/Seoul, America/New_York)",
+            "Unknown time zone '$timezone'. IANA format required (e.g. Asia/Seoul, America/New_York)",
+        )
     }
     val now = ZonedDateTime.now(zone)
     val yesterday = now.minusDays(1)

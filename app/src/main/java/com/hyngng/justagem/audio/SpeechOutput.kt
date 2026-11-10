@@ -202,7 +202,7 @@ class SpeechOutput(context: Context) : Closeable {
     ): Boolean {
         val tts = platformTts(locale) ?: return false
         val done = CompletableDeferred<Boolean>()
-        val currentUtteranceId = "gemtalk-${System.nanoTime()}"
+        val currentUtteranceId = "justagem-${System.nanoTime()}"
         var progressJob: kotlinx.coroutines.Job? = null
         val audioLock = Any()
         var pcmEncoding = 0
