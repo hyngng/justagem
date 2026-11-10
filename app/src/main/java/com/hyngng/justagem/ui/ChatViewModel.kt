@@ -14,11 +14,9 @@ import com.hyngng.justagem.ai.ModelOption
 import com.hyngng.justagem.ai.DEFAULT_SYSTEM_INSTRUCTIONS
 import com.hyngng.justagem.ai.tools.ToolConfirmation
 import com.hyngng.justagem.ai.tools.buildLocalTools
-import com.hyngng.justagem.audio.SpeechEvent
-import com.hyngng.justagem.audio.SpeechInput
-import com.hyngng.justagem.audio.SpeechOutput
 import com.hyngng.justagem.audio.AppFeedbackCue
 import com.hyngng.justagem.audio.AppFeedbackEvent
+import com.hyngng.justagem.ui.voice.VoiceSessionController
 import com.hyngng.justagem.data.ChatMessage
 import com.hyngng.justagem.data.ChatRole
 import com.hyngng.justagem.data.ChatSession
@@ -30,11 +28,8 @@ import com.hyngng.justagem.ui.i18n.tr
 import com.hyngng.justagem.ui.i18n.updateProcessLanguage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -121,12 +116,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val store = SessionStore(application)
     private val engine = GemmaEngine(application)
-    private val speechIn = SpeechInput(application)
-    private val speechOut = SpeechOutput(application)
     val photoIndexManager = PhotoSemanticIndexManager(application)
 
     var uiState by mutableStateOf(ChatUiState())
         private set
+
+    /**
+     * The only way controllers may change `uiState`: they hold this lambda
+     * instead of a write reference, so state ownership stays here while the
+     * voice subsystem etc. keep mutating only their own slice.
+     */
+    private fun updateState(transform: (ChatUiState) -> ChatUiState) {
+        uiState = transform(uiState)
+    }
 
     private var probeJob: Job? = null
     private var downloadJob: Job? = null
@@ -141,12 +143,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var persistJob: Job? = null
     private var titleJob: Job? = null
     private var titleJobSessionId: String? = null
-    private var listenJob: Job? = null
-    private var inputPulseJob: Job? = null
-    private var inputPulseVersion = 0L
-    private var speechQueueJob: Job? = null
-    private var speechChannel: Channel<String>? = null
-    private var autoListenJob: Job? = null
     private var persistedStateLoaded = false
     private var toolConfirmation: CompletableDeferred<Boolean>? = null
     // Model chosen during streaming; applied when the current turn ends.
@@ -154,6 +150,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val noticeIds = AtomicLong(0L)
     private val _feedbackEvents = MutableSharedFlow<AppFeedbackEvent>(extraBufferCapacity = 8)
     val feedbackEvents = _feedbackEvents.asSharedFlow()
+
+    private val voice = VoiceSessionController(
+        application = getApplication(),
+        scope = viewModelScope,
+        state = { uiState },
+        mutate = { transform -> updateState(transform) },
+        isGenerating = { uiState.isGenerating },
+        beginVoiceTurn = { utterance -> beginVoiceTurnFromSpeech(utterance) },
+        stopGenerationNow = { stopGeneration() },
+    )
 
     init {
         // Remove legacy feature stores after their code paths have been removed.
@@ -421,7 +427,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun newSession() {
-        stopVoice(closeOverlay = true)
+        voice.stopVoice(true)
         stopGeneration()
         val kept = uiState.sessions.filter { it.messages.isNotEmpty() }
         uiState = uiState.copy(
@@ -444,7 +450,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (uiState.sessions.none { it.id == id }) return
-        stopVoice(closeOverlay = true)
+        voice.stopVoice(true)
         stopGeneration()
         uiState = uiState.copy(
             activeId = id,
@@ -480,7 +486,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteSession(id: String) {
         val deletingActive = id == uiState.activeId
         if (deletingActive) {
-            stopVoice(closeOverlay = true)
+            voice.stopVoice(true)
             stopGeneration()
         }
         val remaining = uiState.sessions.filterNot { it.id == id }
@@ -739,12 +745,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         generationJob = viewModelScope.launch {
             var assistantId = UUID.randomUUID().toString()
             var builder = StringBuilder()
-            val turnSpeechChannel = if (fromVoice) Channel<String>(Channel.UNLIMITED) else null
-            speechChannel = turnSpeechChannel
-            speechQueueJob = turnSpeechChannel?.let { channel ->
-                launch { speakReplyChunks(channel) }
-            }
-            var speechBuffer = ""
+            val speaker = voice.beginReply(fromVoice)
             // Voice turns take the lower-latency path without changing the
             // user's saved preference for text conversations.
             val thinkingEnabled = uiState.thinkingEnabled && !fromVoice
@@ -842,26 +843,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         is GenerationUpdate.Text -> {
                             builder.append(update.value)
                             updateAssistant(assistantId, builder.toString())
-                            if (fromVoice && turnSpeechChannel != null) {
-                                uiState = uiState.copy(
-                                    voice = uiState.voice.copy(caption = builder.toString()),
-                                )
-                                speechBuffer += update.value
-                                var boundary = findSpeechBoundary(speechBuffer)
-                                while (boundary != -1) {
-                                    turnSpeechChannel.send(speechBuffer.take(boundary))
-                                    speechBuffer = speechBuffer.drop(boundary).trimStart()
-                                    boundary = findSpeechBoundary(speechBuffer)
-                                }
-                            }
+                            speaker?.onAnswerText(builder.toString(), update.value)
                         }
                     }
                 }
 
-                if (turnSpeechChannel != null) {
-                    if (speechBuffer.isNotBlank()) turnSpeechChannel.send(speechBuffer)
-                    turnSpeechChannel.close()
-                }
+                speaker?.completeInput()
                 if (builder.isBlank()) {
                     removeAssistant(assistantId)
                     if (!fromVoice) {
@@ -895,10 +882,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     requestSessionTitle(targetSessionId, firstUserMessage, builder.toString())
                 }
                 if (fromVoice && uiState.voice.active) {
-                    speechQueueJob?.join()
+                    voice.joinReplyQueue()
                 }
             } catch (c: CancellationException) {
-                turnSpeechChannel?.close()
+                speaker?.abort()
                 finishGeneration()
                 persist()
                 if (fromVoice && uiState.voice.active) {
@@ -906,7 +893,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 throw c
             } catch (t: Throwable) {
-                turnSpeechChannel?.close()
+                speaker?.abort()
                 uiState = uiState.copy(streamingMessageId = null)
                 removeAssistant(assistantId)
                 if (!fromVoice) {
@@ -928,8 +915,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
-            if (speechChannel === turnSpeechChannel) speechChannel = null
-            if (speechQueueJob?.isCompleted == true) speechQueueJob = null
+            voice.finishReplyTurn(speaker)
         }
     }
 
@@ -1148,305 +1134,41 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         uiState = uiState.copy(toolConfirmation = null)
     }
 
-    // ---------------------------------------------------------------- voice
+    /**
+     * The real turn sequence for a recognized utterance, exactly as the
+     * in-line speech path used to run it: append the user message, play the
+     * sent cue without sound, then start generating while the overlay shows
+     * THINKING.
+     */
+    private fun beginVoiceTurnFromSpeech(utterance: String) {
+        appendUser(utterance)
+        emitFeedback(AppFeedbackCue.MESSAGE_SENT, allowSound = false)
+        uiState = uiState.copy(
+            isGenerating = true,
+            streamingMessageId = null,
+        )
+        generate(uiState.messages, fromVoice = true)
+    }
 
     fun enterVoiceMode() {
         if (!modelReadyForTurn(noticeText = tr("먼저 Gemma 4 모델을 준비해 주세요.", "Set up the Gemma 4 model first."))) return
         if (uiState.isGenerating) stopGeneration()
-        // Do not grab the microphone before the user asks: the overlay opens
-        // in a clear "tap to talk" state, so a quick tap can never cut a
-        // listening session short by accident.
-        uiState = uiState.copy(
-            voice = VoiceUi(active = true, phase = VoicePhase.IDLE),
-        )
+        voice.enterVoiceMode()
     }
 
     fun exitVoiceMode() {
-        stopVoice(closeOverlay = true)
+        voice.exitVoiceMode()
     }
 
     fun onVoicePrimaryAction() {
-        when (uiState.voice.phase) {
-            VoicePhase.IDLE -> {
-                startListening()
-            }
-            VoicePhase.LISTENING -> {
-                speechIn.stop()
-                // Some recognizers never answer after stopListening(); don't
-                // leave the orb stuck in LISTENING.
-                autoListenJob?.cancel()
-                autoListenJob = viewModelScope.launch {
-                    delay(2_000)
-                    if (uiState.voice.active && uiState.voice.phase == VoicePhase.LISTENING) {
-                        listenJob?.cancel()
-                        listenJob = null
-                        speechIn.stop()
-                        uiState = uiState.copy(
-                            voice = uiState.voice.copy(
-                                phase = VoicePhase.IDLE,
-                                hint = tr("듣지 못했어요. 다시 말씀해 주세요.", "I didn't catch that. Please say it again."),
-                            ),
-                        )
-                    }
-                }
-            }
-
-            VoicePhase.THINKING -> {
-                stopGeneration()
-                startListening()
-            }
-
-            VoicePhase.SPEAKING -> {
-                speechQueueJob?.cancel()
-                speechQueueJob = null
-                speechChannel?.cancel()
-                speechChannel = null
-                speechOut.stop()
-                scheduleListening(200)
-            }
-        }
-    }
-
-    private fun startListening() {
-        if (!uiState.voice.active) return
-        if (uiState.isGenerating) return
-        autoListenJob?.cancel()
-        listenJob?.cancel()
-        clearVoiceInputLevel()
-        speechOut.stop()
-        uiState = uiState.copy(
-            voice = uiState.voice.copy(
-                phase = VoicePhase.LISTENING,
-                transcript = "",
-                caption = "",
-                hint = "",
-            ),
-        )
-        listenJob = viewModelScope.launch {
-            var terminal = false
-            var hasInputLevel = false
-            try {
-                val speechLocale = AppLanguage.resolve(uiState.languageTag).locale
-                speechIn.listen(speechLocale).collect { event ->
-                    if (!uiState.voice.active || uiState.voice.phase != VoicePhase.LISTENING) {
-                        return@collect
-                    }
-                    when (event) {
-                        is SpeechEvent.InputStarted -> {
-                            if (!hasInputLevel) pulseVoiceInput(0.48f)
-                        }
-
-                        is SpeechEvent.InputLevel -> {
-                            hasInputLevel = true
-                            setVoiceInputLevel(event.level)
-                        }
-
-                        is SpeechEvent.Partial -> {
-                            if (event.text != uiState.voice.transcript) {
-                                uiState = uiState.copy(
-                                    voice = uiState.voice.copy(transcript = event.text),
-                                )
-                                if (!hasInputLevel) pulseVoiceInput(0.55f)
-                            }
-                        }
-
-                        is SpeechEvent.Final -> {
-                            terminal = true
-                            val text = event.text.trim()
-                            if (text.isBlank()) {
-                                uiState = uiState.copy(
-                                    voice = uiState.voice.copy(
-                                        phase = VoicePhase.IDLE,
-                                        transcript = "",
-                                        caption = "",
-                                        inputLevel = 0f,
-                                        hint = tr("듣지 못했어요. 다시 말씀해 주세요.", "I didn't catch that. Please say it again."),
-                                    ),
-                                )
-                            } else {
-                                uiState = uiState.copy(
-                                    voice = uiState.voice.copy(
-                                        phase = VoicePhase.THINKING,
-                                        transcript = text,
-                                        caption = text,
-                                        inputLevel = 0f,
-                                        hint = "",
-                                    ),
-                                )
-                                appendUser(text)
-                                emitFeedback(AppFeedbackCue.MESSAGE_SENT, allowSound = false)
-                                uiState = uiState.copy(
-                                    isGenerating = true,
-                                    streamingMessageId = null,
-                                )
-                                generate(uiState.messages, fromVoice = true)
-                            }
-                        }
-
-                        is SpeechEvent.Failed -> {
-                            terminal = true
-                            uiState = uiState.copy(
-                                voice = uiState.voice.copy(
-                                    phase = VoicePhase.IDLE,
-                                    inputLevel = 0f,
-                                    hint = event.message,
-                                ),
-                            )
-                        }
-                    }
-                }
-            } catch (c: CancellationException) {
-                throw c
-            } catch (t: Throwable) {
-                terminal = true
-                if (uiState.voice.active) {
-                    uiState = uiState.copy(
-                        voice = uiState.voice.copy(
-                            phase = VoicePhase.IDLE,
-                            inputLevel = 0f,
-                            hint = tr("음성 인식을 사용할 수 없어요.", "Speech recognition is unavailable."),
-                        ),
-                    )
-                }
-            } finally {
-                // The flow ended without a final/error event (for example the
-                // engine was torn down). Never leave the UI claiming to listen.
-                if (!terminal && uiState.voice.active &&
-                    uiState.voice.phase == VoicePhase.LISTENING
-                ) {
-                    uiState = uiState.copy(
-                        voice = uiState.voice.copy(
-                            phase = VoicePhase.IDLE,
-                            inputLevel = 0f,
-                            hint = tr("다시 탭하여 말씀해 주세요.", "Tap again to speak."),
-                        ),
-                    )
-                }
-            }
-        }
-    }
-
-    private fun pulseVoiceInput(level: Float) {
-        val version = ++inputPulseVersion
-        inputPulseJob?.cancel()
-        uiState = uiState.copy(voice = uiState.voice.copy(inputLevel = level))
-        inputPulseJob = viewModelScope.launch {
-            delay(180)
-            if (version == inputPulseVersion && uiState.voice.phase == VoicePhase.LISTENING) {
-                uiState = uiState.copy(voice = uiState.voice.copy(inputLevel = 0f))
-            }
-        }
-    }
-
-    private fun setVoiceInputLevel(level: Float) {
-        inputPulseVersion++
-        inputPulseJob?.cancel()
-        inputPulseJob = null
-        uiState = uiState.copy(voice = uiState.voice.copy(inputLevel = level.coerceIn(0f, 1f)))
-    }
-
-    private fun clearVoiceInputLevel() {
-        inputPulseVersion++
-        inputPulseJob?.cancel()
-        inputPulseJob = null
-        if (uiState.voice.inputLevel != 0f) {
-            uiState = uiState.copy(voice = uiState.voice.copy(inputLevel = 0f))
-        }
-    }
-
-    private suspend fun speakReplyChunks(chunks: ReceiveChannel<String>) {
-        var spokenCharacters = 0
-        for (chunk in chunks) {
-            if (chunk.isBlank() || !uiState.voice.active) continue
-            if (uiState.voice.phase != VoicePhase.SPEAKING) {
-                uiState = uiState.copy(
-                    voice = uiState.voice.copy(
-                        phase = VoicePhase.SPEAKING,
-                        transcript = "",
-                        caption = uiState.voice.caption.ifBlank { chunk },
-                        captionProgress = 0f,
-                        speechCharacterIndex = 0,
-                        speechLevel = 0f,
-                        hint = "",
-                    ),
-                )
-            }
-            val chunkStart = spokenCharacters
-            val speechLocale = AppLanguage.resolve(uiState.languageTag).locale
-            speechOut.speak(
-                text = chunk,
-                locale = speechLocale,
-                onProgress = { progress ->
-                    if (uiState.voice.active && uiState.voice.phase == VoicePhase.SPEAKING) {
-                        val total = uiState.voice.caption.length.coerceAtLeast(1)
-                        val absolute = (chunkStart + progress * chunk.length) / total
-                        uiState = uiState.copy(
-                            voice = uiState.voice.copy(
-                                captionProgress = absolute.coerceIn(0f, 1f),
-                                speechCharacterIndex = (chunkStart + progress * chunk.length).toInt(),
-                            ),
-                        )
-                    }
-                },
-                onAmplitude = { level ->
-                    if (uiState.voice.active && uiState.voice.phase == VoicePhase.SPEAKING) {
-                        uiState = uiState.copy(
-                            voice = uiState.voice.copy(speechLevel = level.coerceIn(0f, 1f)),
-                        )
-                    }
-                },
-            )
-            spokenCharacters += chunk.length
-        }
-        if (uiState.voice.active && uiState.voice.phase == VoicePhase.SPEAKING) {
-            uiState = uiState.copy(
-                voice = uiState.voice.copy(
-                    captionProgress = 1f,
-                    speechCharacterIndex = uiState.voice.caption.length,
-                    speechLevel = 0f,
-                ),
-            )
-            scheduleListening()
-        }
-    }
-
-    private fun findSpeechBoundary(text: String): Int {
-        val index = text.indexOfFirst { it in ".!?。！？\n" }
-        return if (index >= 0) index + 1 else -1
-    }
-
-    private fun scheduleListening(delayMs: Long = 520) {
-        autoListenJob?.cancel()
-        autoListenJob = viewModelScope.launch {
-            delay(delayMs)
-            if (uiState.voice.active && !uiState.isGenerating) startListening()
-        }
-    }
-
-    private fun stopVoice(closeOverlay: Boolean) {
-        autoListenJob?.cancel()
-        autoListenJob = null
-        listenJob?.cancel()
-        listenJob = null
-        speechQueueJob?.cancel()
-        speechQueueJob = null
-        speechChannel?.cancel()
-        speechChannel = null
-        speechIn.stop()
-        speechOut.stop()
-        uiState = uiState.copy(
-            voice = uiState.voice.copy(active = !closeOverlay),
-        )
-        if (closeOverlay) {
-            uiState = uiState.copy(voice = VoiceUi())
-        }
+        voice.onVoicePrimaryAction()
     }
 
     // ---------------------------------------------------------------- misc
 
     fun onAppBackgrounded() {
         if (uiState.voice.active) {
-            stopVoice(closeOverlay = true)
+            voice.stopVoice(true)
         }
         if (uiState.isGenerating) {
             stopGeneration()
@@ -1565,8 +1287,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         generationJob?.cancel()
         photoIndexManager.close()
         engine.close()
-        speechIn.close()
-        speechOut.close()
+        voice.close()
     }
 }
 
