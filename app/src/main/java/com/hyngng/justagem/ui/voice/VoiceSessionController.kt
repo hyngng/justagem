@@ -81,19 +81,29 @@ class VoiceSessionController(
             }
 
             VoicePhase.THINKING -> {
-                stopGenerationNow()
-                startListening()
+                interruptAndListen()
             }
 
             VoicePhase.SPEAKING -> {
-                speechQueueJob?.cancel()
-                speechQueueJob = null
-                speechChannel?.cancel()
-                speechChannel = null
-                speechOut.stop()
-                scheduleListening(200)
+                interruptAndListen()
             }
         }
+    }
+
+    /**
+     * Immediately halts any ongoing assistant generation and TTS playback,
+     * transitioning the session directly to listening to the user's voice.
+     */
+    fun interruptAndListen() {
+        speechQueueJob?.cancel()
+        speechQueueJob = null
+        speechChannel?.cancel()
+        speechChannel = null
+        speechOut.stop()
+        if (isGenerating()) {
+            stopGenerationNow()
+        }
+        startListening()
     }
 
     fun startListening() {

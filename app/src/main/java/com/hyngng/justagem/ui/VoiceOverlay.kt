@@ -6,6 +6,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -49,8 +50,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -144,9 +148,8 @@ fun VoiceOverlay(
         }
 
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val orbSize = minOf(252.dp, maxHeight * 0.36f).coerceAtLeast(148.dp)
+            val orbSize = 104.dp
             val captionHeight = minOf(146.dp, maxHeight * 0.22f).coerceAtLeast(86.dp)
-            val voiceControlLift = minOf(56.dp, maxHeight * 0.07f)
             val backdrop = MaterialTheme.colorScheme.surfaceVariant
             val background = Ink
             val jadeGlow = Jade
@@ -227,17 +230,26 @@ fun VoiceOverlay(
                         .padding(horizontal = 20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Spacer(Modifier.weight(0.35f))
+                    Spacer(Modifier.height(16.dp))
 
                     GemOrb(
                         state = orbState,
                         modifier = Modifier.size(orbSize),
                         detail = true,
-                        inputLevel = voice.inputLevel,
                         speechLevel = voice.speechLevel,
                     )
 
-                    Spacer(Modifier.height(30.dp))
+                    if (voice.hint.isNotBlank() && voice.hint != mainText) {
+                        Text(
+                            text = voice.hint,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MistFaint,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
+
+                    Spacer(Modifier.weight(1f))
 
                     AnimatedContent(
                         targetState = title,
@@ -296,38 +308,29 @@ fun VoiceOverlay(
                         )
                     }
 
-                    if (voice.hint.isNotBlank() && voice.hint != mainText) {
-                        Text(
-                            text = voice.hint,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MistFaint,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(top = 2.dp),
-                        )
-                    }
-
-                    Spacer(Modifier.weight(1.45f))
+                    Spacer(Modifier.weight(1f))
 
                     Column(
-                        modifier = Modifier.offset(y = -voiceControlLift),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         VoicePrimaryButton(
                             phase = voice.phase,
+                            inputLevel = voice.inputLevel,
+                            buttonSize = orbSize,
                             onClick = onPrimary,
                         )
                         Spacer(Modifier.height(12.dp))
                         Text(
                             text = when (voice.phase) {
                                 VoicePhase.LISTENING -> s.t("탭하여 마치기", "Tap to finish")
-                                VoicePhase.THINKING, VoicePhase.SPEAKING -> s.t("탭하여 멈추기", "Tap to stop")
+                                VoicePhase.THINKING, VoicePhase.SPEAKING -> s.t("탭하여 말하기", "Tap to speak")
                                 VoicePhase.IDLE -> s.t("탭하여 말하기", "Tap to speak")
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MistFaint,
                         )
                     }
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(32.dp))
                 }
             }
         }
@@ -337,39 +340,87 @@ fun VoiceOverlay(
 @Composable
 private fun VoicePrimaryButton(
     phase: VoicePhase,
+    inputLevel: Float,
+    buttonSize: androidx.compose.ui.unit.Dp,
     onClick: () -> Unit,
 ) {
     val interactionHaptics = LocalInteractionHaptics.current
     val listening = phase == VoicePhase.LISTENING
-    val active = phase != VoicePhase.IDLE
+    val orbColor = Jade
+
+    val listeningLevel by animateFloatAsState(
+        targetValue = if (listening) inputLevel.coerceIn(0f, 1f) else 0f,
+        animationSpec = tween(
+            durationMillis = if (listening) 110 else 280,
+            easing = FastOutSlowInEasing,
+        ),
+        label = "userListeningLevel",
+    )
+    val meterOpacity by animateFloatAsState(
+        targetValue = if (listening) 1f else 0f,
+        animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing),
+        label = "userMeterOpacity",
+    )
+
     Box(
-        modifier = Modifier
-            .size(78.dp)
-            .clip(CircleShape)
-            .background(if (active) Jade.copy(alpha = 0.13f) else Graphite.copy(alpha = 0.75f))
-            .border(
-                width = 1.dp,
-                color = if (active) Jade.copy(alpha = 0.55f) else Hairline,
-                shape = CircleShape,
-            )
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = {
-                    interactionHaptics?.perform(HapticFeedbackType.TextHandleMove)
-                    onClick()
-                },
-            ),
+        modifier = Modifier.size(buttonSize),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(
-            imageVector = when {
-                listening || active -> Icons.Rounded.Stop
-                else -> Icons.Rounded.Mic
-            },
-            contentDescription = if (active) tr("멈추기", "Stop") else tr("말하기", "Speak"),
-            tint = if (active) Jade else Mist,
-            modifier = Modifier.size(if (active) 26.dp else 30.dp),
-        )
+        if (meterOpacity > 0.001f) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val center = Offset(size.width / 2f, size.height / 2f)
+                val baseRadius = (minOf(size.width, size.height) / 2f) * 0.72f
+                val meterRadius = baseRadius * 1.18f
+                val stroke = 3.dp.toPx()
+                drawCircle(
+                    color = orbColor.copy(alpha = 0.22f * meterOpacity),
+                    radius = meterRadius,
+                    center = center,
+                    style = Stroke(width = stroke),
+                )
+                if (listeningLevel > 0.01f) {
+                    drawArc(
+                        color = orbColor.copy(alpha = 0.95f * meterOpacity),
+                        startAngle = -90f,
+                        sweepAngle = 360f * listeningLevel,
+                        useCenter = false,
+                        topLeft = Offset(center.x - meterRadius, center.y - meterRadius),
+                        size = Size(meterRadius * 2f, meterRadius * 2f),
+                        style = Stroke(width = stroke, cap = StrokeCap.Round),
+                    )
+                }
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .size(buttonSize * 0.72f)
+                .clip(CircleShape)
+                .background(if (listening) Jade.copy(alpha = 0.15f) else Graphite.copy(alpha = 0.85f))
+                .border(
+                    width = 1.dp,
+                    color = if (listening) Jade.copy(alpha = 0.65f) else Hairline,
+                    shape = CircleShape,
+                )
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {
+                        interactionHaptics?.perform(HapticFeedbackType.TextHandleMove)
+                        onClick()
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = when {
+                    listening -> Icons.Rounded.Stop
+                    else -> Icons.Rounded.Mic
+                },
+                contentDescription = if (listening) tr("멈추기", "Stop") else tr("말하기", "Speak"),
+                tint = if (listening) Jade else Mist,
+                modifier = Modifier.size(28.dp),
+            )
+        }
     }
 }

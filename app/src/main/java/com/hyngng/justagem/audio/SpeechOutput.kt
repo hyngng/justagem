@@ -167,26 +167,35 @@ class SpeechOutput(context: Context) : Closeable {
             var failed = false
             coroutineScope {
                 var progressJob: kotlinx.coroutines.Job? = null
+                var amplitudeJob: kotlinx.coroutines.Job? = null
                 client.synthesize(request).collect { response ->
                     when (response) {
                         is SpeechSynthesizerResponse.StatusUpdate -> when (response.status) {
                             SpeechSynthesizerResponse.Status.START -> {
                                 progressJob?.cancel()
                                 progressJob = launchEstimatedProgress(text, onProgress)
-                                reportOnMain { onAmplitude(0.32f) }
+                                amplitudeJob?.cancel()
+                                amplitudeJob = launchEstimatedAmplitude(onAmplitude)
                             }
 
                             SpeechSynthesizerResponse.Status.DONE,
                             SpeechSynthesizerResponse.Status.STOP,
-                            -> completed = true
+                            -> {
+                                amplitudeJob?.cancel()
+                                completed = true
+                            }
                         }
 
-                        is SpeechSynthesizerResponse.Error -> failed = true
+                        is SpeechSynthesizerResponse.Error -> {
+                            amplitudeJob?.cancel()
+                            failed = true
+                        }
                         // ML Kit exposes bytes without a public PCM format or playback-frame clock.
                         is SpeechSynthesizerResponse.AudioAvailable -> Unit
                     }
                 }
                 progressJob?.cancel()
+                amplitudeJob?.cancel()
             }
             if (completed && !failed) onProgress(1f)
             onAmplitude(0f)
@@ -328,6 +337,24 @@ class SpeechOutput(context: Context) : Closeable {
             withContext(Dispatchers.Main.immediate) {
                 onProgress(progress)
             }
+        }
+    }
+
+    // Synthetic speech-like amplitude for ML Kit, whose API lacks a PCM
+    // playback-frame clock. Two harmonic sine waves produce an organic
+    // pulsing feel that looks like actual speech (see docs/history/
+    // 2026-10-31-speaking-orb-cadence-fix.md for the original design).
+    private fun CoroutineScope.launchEstimatedAmplitude(
+        onAmplitude: (Float) -> Unit,
+    ) = launch {
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        while (isActive) {
+            val t = (android.os.SystemClock.elapsedRealtime() - startedAt) / 1000.0
+            val primary = (Math.sin(2 * Math.PI * t / 0.84).toFloat() * 0.5f + 0.5f)
+            val secondary = (Math.sin(2 * Math.PI * t / 0.48).toFloat() * 0.5f + 0.5f)
+            val level = (0.40f + 0.60f * (primary * 0.6f + secondary * 0.4f)).coerceIn(0f, 1f)
+            withContext(Dispatchers.Main.immediate) { onAmplitude(level) }
+            delay(40)
         }
     }
 

@@ -295,13 +295,13 @@ fun JustagemApp(viewModel: ChatViewModel = viewModel()) {
         snapshotFlow {
             val current = viewModel.uiState
             val message = current.messages.firstOrNull { it.id == current.streamingMessageId }
-            // Voice mode reserves audio playback for TTS.
+            // Voice mode reserves audio and haptics for speech interaction.
             Triple(
                 current.streamingMessageId,
                 message?.text.orEmpty(),
                 Triple(
                     message?.thoughtText.orEmpty(),
-                    current.hapticsEnabled,
+                    current.hapticsEnabled && !current.voice.active,
                     current.soundsEnabled && !current.voice.active,
                 ),
             )

@@ -70,25 +70,16 @@ fun GemOrb(
         label = "breathAmplitude",
     )
 
-    val listeningLevel by animateFloatAsState(
-        targetValue = if (state == OrbState.LISTENING) inputLevel.coerceIn(0f, 1f) else 0f,
-        animationSpec = tween(
-            durationMillis = if (state == OrbState.LISTENING) 110 else 280,
-            easing = FastOutSlowInEasing,
-        ),
-        label = "listeningLevel",
-    )
-
-    val voiceEnergy by animateFloatAsState(
-        targetValue = if (isSpeaking) speechLevel.coerceIn(0f, 1f) else 0f,
+    val speakingLevel by animateFloatAsState(
+        targetValue = if (state == OrbState.SPEAKING) speechLevel.coerceIn(0f, 1f) else 0f,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioNoBouncy,
             stiffness = Spring.StiffnessHigh,
         ),
-        label = "voiceEnergy",
+        label = "speakingLevel",
     )
     val meterOpacity by animateFloatAsState(
-        targetValue = if (state == OrbState.LISTENING) 1f else 0f,
+        targetValue = if (state == OrbState.SPEAKING) 1f else 0f,
         animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing),
         label = "meterOpacity",
     )
@@ -97,18 +88,12 @@ fun GemOrb(
         val center = Offset(size.width / 2f, size.height / 2f)
         val unit = min(size.width, size.height)
 
-        // Base breathing motion when not speaking
+        // Base breathing motion
         val breath = 1f + (breathPhase * 2f - 1f) * breathAmplitude
-
-        val activeScale = when (state) {
-            OrbState.LISTENING -> breath * (1f + listeningLevel * 0.045f)
-            OrbState.SPEAKING -> 1f + voiceEnergy * 0.065f
-            else -> breath
-        }
-        val radius = unit * 0.335f * activeScale
+        val radius = unit * 0.35f * breath
 
         if (detail && meterOpacity > 0.001f) {
-            val meterRadius = radius * 1.14f
+            val meterRadius = radius * 1.18f
             val stroke = 3.dp.toPx()
             drawCircle(
                 color = orbColor.copy(alpha = 0.22f * meterOpacity),
@@ -116,11 +101,11 @@ fun GemOrb(
                 center = center,
                 style = Stroke(width = stroke),
             )
-            if (listeningLevel > 0.01f) {
+            if (speakingLevel > 0.01f) {
                 drawArc(
                     color = orbColor.copy(alpha = 0.95f * meterOpacity),
                     startAngle = -90f,
-                    sweepAngle = 360f * listeningLevel,
+                    sweepAngle = 360f * speakingLevel,
                     useCenter = false,
                     topLeft = Offset(center.x - meterRadius, center.y - meterRadius),
                     size = Size(meterRadius * 2f, meterRadius * 2f),
